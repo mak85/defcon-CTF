@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-angr solver for myfavoriteinstructions
+angr solver — attempt 6: pure DFS, no veritesting, expanded timeouts.
 
-Strategy: symbolically execute main with a 68-char symbolic argv[1],
-then find a state where execution reaches the CMP at 0x14dd40
-with EAX == 2 (the win condition).
+The validator has ~16 branches in 70K instructions; without veritesting
+each step is a basic block (huge linear region). Try this for speed.
 """
 
 import angr
@@ -13,71 +12,114 @@ import logging
 import sys
 import time
 
-logging.getLogger('angr').setLevel(logging.ERROR)
+logging.getLogger('angr').setLevel(logging.WARNING)
+sys.setrecursionlimit(50000)
 
 BINARY = './myfavoriteinstructions'
-FLAG_LEN = 68
+GHIDRA_BASE = 0x100000
+OFF_VALIDATOR = 0x1011a0 - GHIDRA_BASE
 
-# Key addresses from Ghidra analysis (assuming non-PIE; otherwise add base)
-ADDR_VALIDATOR_RET = 0x14dd40   # CMP EAX, 0x2 — return point of FUN_001011a0
-ADDR_TOO_SHORT     = 0x14dd8f   # "Flag too short" branch — avoid
-ADDR_USAGE_1       = 0x14dd6c   # usage branch — avoid
-ADDR_USAGE_2       = 0x14dd6d   # usage branch — avoid
+ARRAY_LEN_U64 = 360
+ARRAY_ADDR    = 0x60000000
+STACK_BASE    = 0x70000000
+STACK_TOP     = 0x70200000
+FAKE_RET      = 0xdeadbeefcafef00d
 
 
 def main():
     print(f'[+] Loading {BINARY}')
     proj = angr.Project(BINARY, auto_load_libs=False)
-    print(f'[+] Arch: {proj.arch}, entry: {hex(proj.entry)}, base: {hex(proj.loader.main_object.mapped_base)}')
+    base = proj.loader.main_object.mapped_base
+    addr_validator = base + OFF_VALIDATOR
 
-    # Build 68-byte symbolic flag, restrict to printable ASCII
-    flag_bytes = [claripy.BVS(f'f{i}', 8) for i in range(FLAG_LEN)]
-    flag = claripy.Concat(*flag_bytes)
+    sym = [claripy.BVS(f't{i}', 64) for i in range(ARRAY_LEN_U64)]
 
-    # argv[1] needs to be null-terminated for strlen
-    argv1 = claripy.Concat(flag, claripy.BVV(0, 8))
-
-    state = proj.factory.full_init_state(
-        args=[BINARY, argv1],
+    state = proj.factory.blank_state(
+        addr=addr_validator,
         add_options={
             angr.options.LAZY_SOLVES,
-            angr.options.SYMBOL_FILL_UNCONSTRAINED_REGISTERS,
-            angr.options.SYMBOL_FILL_UNCONSTRAINED_MEMORY,
+            angr.options.ZERO_FILL_UNCONSTRAINED_MEMORY,
+            angr.options.ZERO_FILL_UNCONSTRAINED_REGISTERS,
+        },
+        remove_options={
+            angr.options.STRICT_PAGE_ACCESS,
         },
     )
+    state.memory.map_region(STACK_BASE, STACK_TOP - STACK_BASE, 0b111)
 
-    # Printable ASCII constraint
-    for b in flag_bytes:
-        state.solver.add(b >= 0x20)
-        state.solver.add(b <= 0x7e)
+    for i, s in enumerate(sym):
+        state.memory.store(ARRAY_ADDR + i*8, s, endness='Iend_LE')
+        state.solver.add(s >= 0)
+        state.solver.add(s <= 2)
+    state.regs.r12 = ARRAY_ADDR
+    state.regs.rsp = STACK_TOP - 8
+    state.memory.store(STACK_TOP - 8, claripy.BVV(FAKE_RET, 64), endness='Iend_LE')
 
-    sm = proj.factory.simulation_manager(state)
+    sm = proj.factory.simulation_manager(state, save_unsat=True)
+    sm.use_technique(angr.exploration_techniques.DFS())
 
-    print(f'[+] Exploring to {hex(ADDR_VALIDATOR_RET)} avoiding error branches...')
+    print(f'[+] Starting DFS exploration...', flush=True)
     t0 = time.time()
-    sm.explore(
-        find=ADDR_VALIDATOR_RET,
-        avoid=[ADDR_TOO_SHORT, ADDR_USAGE_1, ADDR_USAGE_2],
-    )
-    print(f'[+] Exploration took {time.time()-t0:.1f}s')
-    print(f'[+] found={len(sm.found)}, avoid={len(sm.avoid)}, active={len(sm.active)}')
+    last_print = t0
 
-    if not sm.found:
-        print('[-] No path reached the validator return.')
-        return 1
+    step_count = 0
+    finished_states = []
 
-    found = sm.found[0]
-    # Constrain EAX == 2 (the win condition)
-    found.solver.add(found.regs.eax == 2)
+    while sm.active and (time.time() - t0) < 1800:  # 30 min
+        try:
+            sm.step()
+        except Exception as e:
+            print(f'[!] step error: {e}', flush=True)
+            break
+        step_count += 1
 
-    if not found.satisfiable():
-        print('[-] Reached validator return but EAX==2 is unsatisfiable.')
-        return 1
+        now = time.time()
+        if now - last_print > 5:
+            try:
+                pcs = [hex(s.solver.eval(s.regs.rip)) for s in sm.active[:3]]
+            except Exception:
+                pcs = ['?']
+            stashes_summary = {k: len(v) for k, v in sm.stashes.items() if v}
+            print(f'    [{now-t0:.0f}s] step {step_count}: '
+                  f'stashes={stashes_summary} pc={pcs}', flush=True)
+            last_print = now
 
-    flag_val = found.solver.eval(flag, cast_to=bytes)
-    print(f'\n[+] FLAG: {flag_val.decode(errors="replace")}')
-    print(f'[+] hex : {flag_val.hex()}')
-    return 0
+        still_active = []
+        for s in sm.active:
+            try:
+                if s.solver.is_true(s.regs.rip == FAKE_RET):
+                    finished_states.append(s)
+                else:
+                    still_active.append(s)
+            except Exception:
+                still_active.append(s)
+        sm.stashes['active'] = still_active
+
+    elapsed = time.time() - t0
+    print(f'[+] Stopped after {elapsed:.0f}s, {step_count} steps', flush=True)
+    print(f'    stashes: {dict((k, len(v)) for k, v in sm.stashes.items() if v)}')
+    print(f'    finished={len(finished_states)}')
+    if sm.errored:
+        print(f'[!] errored states: {len(sm.errored)}')
+        for e in sm.errored[:3]:
+            print(f'    error: {e.error}')
+
+    candidates = finished_states + sm.deadended
+    for st in candidates:
+        try:
+            st.solver.add(st.regs.rax & 0xffffffff == 2)
+            if st.satisfiable():
+                vals = [st.solver.eval(s) for s in sym]
+                print(f'[+] WIN!')
+                print(vals)
+                with open('ternary_digits.txt', 'w') as f:
+                    f.write(','.join(map(str, vals)))
+                return 0
+        except Exception:
+            pass
+
+    print('[-] No winning state.')
+    return 1
 
 
 if __name__ == '__main__':
