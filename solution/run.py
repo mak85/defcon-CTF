@@ -30,7 +30,7 @@ PORT = 1337
 DEFAULT_TOKEN = "eyJ0eXAiOiJKV1QiLCJhbGciOiJFZERTQSJ9.eyJpc3MiOiJiYmItYXBpIiwiYXVkIjoic29hcmluZy1zd2lmdHMiLCJleHAiOjE3ODAxNjUzMjYsInN1YiI6IjMyMSIsImdlbiI6MCwiaWF0IjoxNzc5NTYwNTI2fQ.tpis4c3WV5X-J-avcqnHpWyW7gMKzVLY1J2VtWA1OfIpHhZXCq4zDEYd3ngPrBKYaBb744FygbHwDRzxIWl9Dg"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-SOLVER = os.path.join(HERE, "solve_binary.py")
+SOLVER = os.path.join(HERE, "solve_z3.py")
 
 
 def log(msg):
@@ -73,9 +73,9 @@ def solve_pow(pow_cmd):
 
 
 def solve_binary(binary_path):
-    log(f"angr-solving {binary_path}")
-    out = subprocess.check_output([sys.executable, SOLVER, binary_path], timeout=900)
-    return out.decode().strip()
+    log(f"solving {binary_path}")
+    out = subprocess.check_output([sys.executable, SOLVER, binary_path, "50"], timeout=900)
+    return out.decode().strip().splitlines()[-1]
 
 
 def main():

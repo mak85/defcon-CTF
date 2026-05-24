@@ -21,8 +21,12 @@ We:
 
 ## Files
 
-- `solve_binary.py` - takes one path to a compiled binary, prints the
-  recovered 32-char secret on stdout.
+- `solve_z3.py` - **primary solver**. Disassembles the binary, peephole-detects
+  the eqCheck pattern, then symbolically executes the main_loop body iteratively
+  until z3 can constrain `[realBase]` to `successLabel`. Handles the 21KB
+  challenge binaries in a few seconds.
+- `solve_binary.py` - angr-based fallback. Slow on large binaries because angr's
+  symbolic memory blows up when `rbp` is symbolic; kept for reference.
 - `run.py` - end-to-end driver: connects to the CTF server, sends the
   token, solves the argon2id proof-of-work, downloads each of the 3
   challenge binaries, runs the solver, submits the answer, prints the
@@ -31,14 +35,14 @@ We:
 ## Running
 
 On a machine with outbound TCP to the CTF server and to
-`pow.ctfwithbirds.com` (a Kali container with the usual networking is
-fine), in a virtualenv with `angr` installed:
+`pow.ctfwithbirds.com`, in a virtualenv with `z3-solver` and `pyelftools`
+installed (no angr needed for the primary solver):
 
 ```bash
 # one-time setup
 python3 -m venv venv
 source venv/bin/activate
-pip install angr
+pip install z3-solver pyelftools
 
 # run the full pipeline
 python3 run.py
