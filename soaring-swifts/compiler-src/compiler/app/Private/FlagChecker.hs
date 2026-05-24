@@ -15,17 +15,19 @@ makeFlagChecker :: Keys -> String -> Program String
 makeFlagChecker keys flag =
   let nWords = (length flag + 7) `div` 8
       flagWords = [packWord (drop (i*8) flag) | i <- [0..nWords-1]]
-      keysExt = take 128 (keys ++ repeat 0xDEADBEEF)
-      -- 8 rounds per word
-      rndS a k1 k2 k3 = BitXor (Mul (Add a (VNum k1)) (VNum k2)) (VNum k3)
-      rndC a k1 k2 k3 = ((a + k1) * k2) `xor` k3
-      mixSym a i = foldl' (\acc r -> rndS acc (keysExt!!((i*24+r*3) `mod` 128)) (keysExt!!((i*24+r*3+1) `mod` 128)) (keysExt!!((i*24+r*3+2) `mod` 128))) a [0..30]
-      mixCon a i = foldl' (\acc r -> rndC acc (keysExt!!((i*24+r*3) `mod` 128)) (keysExt!!((i*24+r*3+1) `mod` 128)) (keysExt!!((i*24+r*3+2) `mod` 128))) a [0..30]
+      keysExt = take 256 (keys ++ repeat 0xDEADBEEF)
+      -- Per-word: simple per-word equality
       mkCheck i =
-        let fw = flagWords !! i
-            target = mixCon fw i
-            sym = mixSym (InputWord (fromIntegral i)) i
-        in Eq sym (VNum target)
+        let k = keysExt !! i
+            fw = flagWords !! i
+        in Eq (BitXor (InputWord (fromIntegral i)) (VNum k)) (VNum (fw `xor` k))
       checks = map mkCheck [0..nWords-1]
-      combined = foldr1 (\a b -> IfP a b (Eq (VNum 0) (VNum 1))) checks
-  in Module (Halt combined)
+      eqAnd = foldr1 (\a b -> IfP a b (Eq (VNum 0) (VNum 1))) checks
+      -- Wrap in a LetLoop that iterates many times before checking
+      finalP =
+        LetLoop
+          [("counter", VNum 100)]
+          (Eq (Identifier "counter") (VNum 0))
+          (Halt eqAnd)
+          [Sub (Identifier "counter") (VNum 1)]
+  in Module finalP

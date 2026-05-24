@@ -160,8 +160,44 @@ def optimize_body(body):
             if ok:
                 # Emit pseudo-op: EQCHECK_R9 -> r12 = (1<<30) if r9==0 else 0
                 out.append((a, "_eqcheck_r9", ""))
-                # Also need to fake the rcx/r11/r9 side effects (rcx becomes bsr position, r9 becomes 0 or 0, r11 likewise)
                 i += 1 + len(actual)
+                continue
+
+            # ltCheck pattern: bsr rcx,r9; mov r11,r9; shr r11,cl; mov r9,r11; mov r11,r10; shr r11,cl; mov r10,r11; mov r11,r10; and r11,r9; mov r10,r11; mov r11,r10; mov ecx,0x1e; shl r11,cl; mov r10,r11; mov r11,r10; mov r12,r11
+            actual_lt = [
+                ("mov", r"r11\s*,\s*r9"),
+                ("shr", r"r11\s*,\s*cl"),
+                ("mov", r"r9\s*,\s*r11"),
+                ("mov", r"r11\s*,\s*r10"),
+                ("shr", r"r11\s*,\s*cl"),
+                ("mov", r"r10\s*,\s*r11"),
+                ("mov", r"r11\s*,\s*r10"),
+                ("and", r"r11\s*,\s*r9"),
+                ("mov", r"r10\s*,\s*r11"),
+                ("mov", r"r11\s*,\s*r10"),
+                ("mov", r"e?cx\s*,\s*0x1e\b"),
+                ("shl", r"r11\s*,\s*cl"),
+                ("mov", r"r10\s*,\s*r11"),
+                ("mov", r"r11\s*,\s*r10"),
+                ("mov", r"r12\s*,\s*r11"),
+            ]
+            ok2 = True
+            if i + len(actual_lt) >= len(body):
+                ok2 = False
+            else:
+                for k, (em, eo) in enumerate(actual_lt):
+                    aa, am, ao = body[i + 1 + k]
+                    if am != em or not re.match(eo, ao.strip()):
+                        ok2 = False
+                        break
+            if ok2:
+                # ltCheck: r12 = (1<<30) if (r10 & r9) at bsr-position bit makes triv1<triv2
+                # The semantics are: r12 = (1<<30) if triv1 < triv2 else 0
+                # Since we lost access to triv1/triv2 by now, use the r9 (XOR) and r10 (original triv2)
+                # The actual check: highest differing bit, if r10's bit at that position is 1, then triv1<triv2
+                # We'll emit a pseudo-op that the executor implements
+                out.append((a, "_ltcheck", ""))
+                i += 1 + len(actual_lt)
                 continue
         # Similar pattern for ltCheck would go here (skipping for now)
         out.append((a, m, o))
@@ -262,6 +298,27 @@ class Interp:
         parts = [p.strip() for p in ops.split(",")] if ops else []
         opnds = [parse_operand(p) for p in parts]
 
+        if mnem == "_ltcheck":
+            # ltCheck: r10 = original triv2, r9 = triv1 XOR triv2; r12 = (1<<30) if triv1<triv2 else 0
+            # When r9 = triv1 XOR triv2:
+            #   - if triv1 == triv2: r12 = 0
+            #   - else: bit at position bsr(r9) is the highest differing bit
+            #     if triv1's bit there is 0 and triv2's is 1, then triv1 < triv2
+            # Equivalent to: r12 = (1<<30) if (triv1 < triv2) else 0
+            # Since at this point r10 = triv2 (zero-ext) and r9 = triv1 ^ triv2 = triv2 ^ triv1:
+            # triv1 = r10 ^ r9. So compare (r10 ^ r9) < r10 (unsigned)?
+            # Actually ltCheck implements UNSIGNED less-than via this bit trick.
+            r9 = self.regs["r9"]
+            r10 = self.regs["r10"]
+            triv1 = r10 ^ r9
+            triv2 = r10
+            self.regs["r12"] = z3.If(z3.ULT(triv1, triv2),
+                                     z3.BitVecVal(1 << 30, 64),
+                                     z3.BitVecVal(0, 64))
+            self.regs["r9"] = z3.BitVecVal(0, 64)
+            self.regs["r10"] = self.regs["r12"]
+            self.regs["r11"] = self.regs["r12"]
+            return
         if mnem == "_eqcheck_r9":
             # r12 = (1 << 30) if r9 == 0 else 0
             r9 = self.regs["r9"]
@@ -394,7 +451,7 @@ def main():
 
     import time
     solver = z3.Solver()
-    solver.set("timeout", 60000)  # 60s per check
+    solver.set("timeout", 300000)  # 5min per check
     for b in input_bytes:
         solver.add(b >= ord("a"), b <= ord("z"))
 
@@ -402,8 +459,27 @@ def main():
     body = optimize_body(body)
     print(f"[z3] optimized body: {len(body)} insns", file=sys.stderr)
 
+    def rebind_state(interp, solver, prefix):
+        """Replace each persistent memory cell with a FRESH variable and an
+        equality constraint on the solver. Keeps the live exprs shallow at the
+        cost of growing the solver's constraint list."""
+        new_mem = {}
+        for k, v in interp.mem.items():
+            if isinstance(k, int) and (REAL_BASE <= k < REAL_BASE + 0x1000
+                                       or FAKE_BASE <= k < FAKE_BASE + 0x1000):
+                fresh = z3.BitVec(f"{prefix}_{k:x}", 64)
+                solver.add(fresh == v)
+                new_mem[k] = fresh
+            else:
+                new_mem[k] = v
+        interp.mem = new_mem
+
     for it in range(max_iters):
         t0 = time.time()
+        # Reset scratch registers between iterations - they're always written
+        # before being read in main_loop body.
+        for r in ("rax", "rbx", "rcx", "rdx", "r8", "r9", "r10", "r11", "r12", "r14"):
+            interp.regs[r] = z3.BitVecVal(0, 64)
         for (a, m, o) in body:
             try:
                 interp.execute(a, m, o)
@@ -412,10 +488,13 @@ def main():
                 sys.exit(3)
         rb_val = interp.mem.get(REAL_BASE, z3.BitVecVal(0, 64))
         rb_val = z3.simplify(rb_val)
-        # Also simplify rbp and memory entries to prevent expression blowup
+        interp.mem[REAL_BASE] = rb_val
         interp.regs["rbp"] = z3.simplify(interp.regs["rbp"])
         for k in list(interp.mem.keys()):
             interp.mem[k] = z3.simplify(interp.mem[k])
+        # Every few iterations, rebind to keep exprs shallow
+        if (it + 1) % 4 == 0:
+            rebind_state(interp, solver, f"i{it}")
         t_exec = time.time() - t0
         t0 = time.time()
         solver.push()
@@ -427,9 +506,27 @@ def main():
             model = solver.model()
             secret = bytes(model[b].as_long() for b in input_bytes).decode()
             print(f"[z3] solved at iter {it+1}: {secret!r}", file=sys.stderr)
-            print(secret)
-            return
+            # Verify locally; if it fails, exclude this guess and keep searching.
+            verified = False
+            try:
+                r = subprocess.run([binary], input=secret.encode(), timeout=10, capture_output=True)
+                print(f"[verify] exit={r.returncode}", file=sys.stderr)
+                verified = (r.returncode == 0)
+            except Exception as e:
+                print(f"[verify] err: {e}", file=sys.stderr)
+            if verified:
+                print(secret)
+                return
+            print("[z3] verify failed - excluding and retrying", file=sys.stderr)
+            solver.pop()
+            # Exclude this concrete secret
+            solver.add(z3.Or(*[input_bytes[i] != ord(secret[i]) for i in range(SECRET_LEN)]))
+            continue
         solver.pop()
+        # Detect stable failure: if rb_val is concrete FAILURE, we're done (no solution).
+        if isinstance(rb_val, z3.BitVecNumRef) and rb_val.as_long() == FAILURE_LABEL:
+            print("[z3] rb_val concretely FAILURE - no solution possible", file=sys.stderr)
+            sys.exit(1)
 
     print("[z3] no solution within iteration limit", file=sys.stderr)
     sys.exit(1)
